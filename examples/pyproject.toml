@@ -1,0 +1,18 @@
+[project]
+name = "ultralytics_exploration"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Yash Chauhan",email = "yashc9411407582@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ultralytics (>=8.3.155,<9.0.0)",
+    "ruff (>=0.11.13,<0.12.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

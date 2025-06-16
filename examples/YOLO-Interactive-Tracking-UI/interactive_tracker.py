@@ -1,110 +1,85 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
 import time
 from typing import Tuple
-
 import cv2
+from threading import Thread
+from queue import Queue
 
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
 from ultralytics.utils.plotting import Annotator, colors
 
-enable_gpu = False  # Set True if running with CUDA
-model_file = "yolo11s.pt"  # Path to model file
-show_fps = True  # If True, shows current FPS in top-left corner
-show_conf = False  # Display or hide the confidence score
-save_video = True  # Set True to save output video
-video_output_path = "interactive_tracker_output.avi"  # Output video file name
+# ─────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────
+enable_gpu = False
+model_file = "yolov8n.pt"
+show_fps = True
+show_conf = False
+save_video = True
+video_output_path = "interactive_tracker_output.avi"
 
+conf = 0.3
+iou = 0.3
+max_det = 20
+tracker = "bytetrack.yaml"
+track_args = {"persist": True, "verbose": False}
+window_name = "Ultralytics YOLO Interactive Tracking"
 
-conf = 0.3  # Min confidence for object detection (lower = more detections, possibly more false positives)
-iou = 0.3  # IoU threshold for NMS (higher = less overlap allowed)
-max_det = 20  # Maximum objects per image (increase for crowded scenes)
+resize_dims = (640, 480)  # Resize to improve performance
+detect_every_n_frames = 2  # Run detection every N frames
 
-tracker = "bytetrack.yaml"  # Tracker config: 'bytetrack.yaml', 'botsort.yaml', etc.
-track_args = {
-    "persist": True,  # Keep frames history as a stream for continuous tracking
-    "verbose": False,  # Print debug info from tracker
-}
-
-window_name = "Ultralytics YOLO Interactive Tracking"  # Output window name
-
+# ─────────────────────────────────────────────────────────────
+# Initialize
+# ─────────────────────────────────────────────────────────────
 LOGGER.info("🚀 Initializing model...")
+model = YOLO(model_file, task="detect")
 if enable_gpu:
-    LOGGER.info("Using GPU...")
-    model = YOLO(model_file)
     model.to("cuda")
-else:
-    LOGGER.info("Using CPU...")
-    model = YOLO(model_file, task="detect")
 
-classes = model.names  # Store model class names
+classes = model.names
 
-cap = cv2.VideoCapture(0)  # Replace with video path if needed
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-# Initialize video writer
-vw = None
-if save_video:
-    w, h, fps = (int(cap.get(x)) for x in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT, cv2.CAP_PROP_FPS))
-    vw = cv2.VideoWriter(video_output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+w, h = resize_dims
+fps = cap.get(cv2.CAP_PROP_FPS) or 30
+vw = cv2.VideoWriter(video_output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)) if save_video else None
 
 selected_object_id = None
-selected_bbox = None
-selected_center = None
+
+# ─────────────────────────────────────────────────────────────
+# Frame Reader Thread
+# ─────────────────────────────────────────────────────────────
+frame_queue = Queue(maxsize=5)
 
 
+def frame_reader():
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+        frame_queue.put(frame)
+
+
+reader_thread = Thread(target=frame_reader, daemon=True)
+reader_thread.start()
+
+
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
 def get_center(x1: int, y1: int, x2: int, y2: int) -> Tuple[int, int]:
-    """
-    Calculate the center point of a bounding box.
-
-    Args:
-        x1 (int): Top-left X coordinate.
-        y1 (int): Top-left Y coordinate.
-        x2 (int): Bottom-right X coordinate.
-        y2 (int): Bottom-right Y coordinate.
-
-    Returns:
-        center_x (int): X-coordinate of the center point.
-        center_y (int): Y-coordinate of the center point.
-    """
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
 def extend_line_from_edge(mid_x: int, mid_y: int, direction: str, img_shape: Tuple[int, int, int]) -> Tuple[int, int]:
-    """
-    Calculate the endpoint to extend a line from the center toward an image edge.
-
-    Args:
-        mid_x (int): X-coordinate of the midpoint.
-        mid_y (int): Y-coordinate of the midpoint.
-        direction (str): Direction to extend ('left', 'right', 'up', 'down').
-        img_shape (Tuple[int, int, int]): Image shape in (height, width, channels).
-
-    Returns:
-        end_x (int): X-coordinate of the endpoint.
-        end_y (int): Y-coordinate of the endpoint.
-    """
     h, w = img_shape[:2]
-    if direction == "left":
-        return 0, mid_y
-    if direction == "right":
-        return w - 1, mid_y
-    if direction == "up":
-        return mid_x, 0
-    if direction == "down":
-        return mid_x, h - 1
-    return mid_x, mid_y
+    return {"left": (0, mid_y), "right": (w - 1, mid_y), "up": (mid_x, 0), "down": (mid_x, h - 1)}.get(
+        direction, (mid_x, mid_y)
+    )
 
 
 def draw_tracking_scope(im, bbox: tuple, color: tuple) -> None:
-    """
-    Draw tracking scope lines extending from the bounding box to image edges.
-
-    Args:
-        im (ndarray): Image array to draw on.
-        bbox (tuple): Bounding box coordinates (x1, y1, x2, y2).
-        color (tuple): Color in BGR format for drawing.
-    """
     x1, y1, x2, y2 = bbox
     mid_top = ((x1 + x2) // 2, y1)
     mid_bottom = ((x1 + x2) // 2, y2)
@@ -116,53 +91,62 @@ def draw_tracking_scope(im, bbox: tuple, color: tuple) -> None:
     cv2.line(im, mid_right, extend_line_from_edge(*mid_right, "right", im.shape), color, 2)
 
 
-def click_event(event: int, x: int, y: int, flags: int, param) -> None:
-    """
-    Handle mouse click events to select an object for focused tracking.
+# Store latest results for click callback
+last_results = [None]
 
-    Args:
-        event (int): OpenCV mouse event type.
-        x (int): X-coordinate of the mouse event.
-        y (int): Y-coordinate of the mouse event.
-        flags (int): Any relevant flags passed by OpenCV.
-        param (Any): Additional parameters (not used).
-    """
+
+def click_event(event: int, x: int, y: int, flags: int, param) -> None:
     global selected_object_id
     if event == cv2.EVENT_LBUTTONDOWN:
-        detections = results[0].boxes.data if results[0].boxes is not None else []
-        if detections is not None:
-            min_area = float("inf")
-            best_match = None
+        if last_results[0] and last_results[0].boxes is not None:
+            detections = last_results[0].boxes.data
             for track in detections:
                 track = track.tolist()
                 if len(track) >= 6:
                     x1, y1, x2, y2 = map(int, track[:4])
                     if x1 <= x <= x2 and y1 <= y <= y2:
-                        area = (x2 - x1) * (y2 - y1)
-                        if area < min_area:
-                            class_id = int(track[-1])
-                            track_id = int(track[4]) if len(track) == 7 else -1
-                            min_area = area
-                            best_match = (track_id, model.names[class_id])
-            if best_match:
-                selected_object_id, label = best_match
-                print(f"🔵 TRACKING STARTED: {label} (ID {selected_object_id})")
+                        track_id = int(track[4]) if len(track) == 7 else -1
+                        selected_object_id = track_id
+                        print(f"🔵 TRACKING STARTED: ID {selected_object_id}")
 
 
 cv2.namedWindow(window_name)
 cv2.setMouseCallback(window_name, click_event)
 
-fps_counter, fps_timer, fps_display = 0, time.time(), 0
+# ─────────────────────────────────────────────────────────────
+# Main Loop
+# ─────────────────────────────────────────────────────────────
+fps_counter = 0
+fps_timer = time.time()
+fps_display = 0
+frame_count = 0
+results = None
 
 while cap.isOpened():
-    success, im = cap.read()
-    if not success:
-        break
+    if frame_queue.empty():
+        continue
 
-    results = model.track(im, conf=conf, iou=iou, max_det=max_det, tracker=tracker, **track_args)
+    frame = frame_queue.get()
+    im = cv2.resize(frame, resize_dims)
+    frame_count += 1
+
+    run_detection = frame_count % detect_every_n_frames == 0
+
+    if run_detection or results is None:
+        try:
+            results = model.track(im, conf=conf, iou=iou, max_det=max_det, tracker=tracker, **track_args)
+        except Exception as e:
+            LOGGER.warning(f"⚠️ Tracking failed: {e}")
+            continue
+
+    if results is None or len(results) == 0 or results[0].boxes is None:
+        LOGGER.warning("⚠️ No detection results.")
+        continue
+
+    last_results[0] = results[0]  # Update for click event
     annotator = Annotator(im)
-    detections = results[0].boxes.data if results[0].boxes is not None else []
-    detected_objects = []
+    detections = results[0].boxes.data
+
     for track in detections:
         track = track.tolist()
         if len(track) < 6:
@@ -171,30 +155,17 @@ while cap.isOpened():
         class_id = int(track[6]) if len(track) >= 7 else int(track[5])
         track_id = int(track[4]) if len(track) == 7 else -1
         color = colors(track_id, True)
-        txt_color = annotator.get_txt_color(color)
         label = f"{classes[class_id]} ID {track_id}" + (f" ({float(track[5]):.2f})" if show_conf else "")
+
         if track_id == selected_object_id:
             draw_tracking_scope(im, (x1, y1, x2, y2), color)
             center = get_center(x1, y1, x2, y2)
             cv2.circle(im, center, 6, color, -1)
-
-            # Pulsing circle for attention
             pulse_radius = 8 + int(4 * abs(time.time() % 1 - 0.5))
             cv2.circle(im, center, pulse_radius, color, 2)
-
             annotator.box_label([x1, y1, x2, y2], label=f"ACTIVE: TRACK {track_id}", color=color)
         else:
-            # Draw dashed box for other objects
-            for i in range(x1, x2, 10):
-                cv2.line(im, (i, y1), (i + 5, y1), color, 3)
-                cv2.line(im, (i, y2), (i + 5, y2), color, 3)
-            for i in range(y1, y2, 10):
-                cv2.line(im, (x1, i), (x1, i + 5), color, 3)
-                cv2.line(im, (x2, i), (x2, i + 5), color, 3)
-            # Draw label text with background
-            (tw, th), bl = cv2.getTextSize(label, 0, 0.7, 2)
-            cv2.rectangle(im, (x1 + 5 - 5, y1 + 20 - th - 5), (x1 + 5 + tw + 5, y1 + 20 + bl), color, -1)
-            cv2.putText(im, label, (x1 + 5, y1 + 20), 0, 0.7, txt_color, 1, cv2.LINE_AA)
+            annotator.box_label([x1, y1, x2, y2], label=label, color=color)
 
     if show_fps:
         fps_counter += 1
@@ -203,9 +174,7 @@ while cap.isOpened():
             fps_counter = 0
             fps_timer = time.time()
 
-        # Draw FPS text with background
         fps_text = f"FPS: {fps_display}"
-        cv2.putText(im, fps_text, (10, 25), 0, 0.7, (255, 255, 255), 1)
         (tw, th), bl = cv2.getTextSize(fps_text, 0, 0.7, 2)
         cv2.rectangle(im, (10 - 5, 25 - th - 5), (10 + tw + 5, 25 + bl), (255, 255, 255), -1)
         cv2.putText(im, fps_text, (10, 25), 0, 0.7, (104, 31, 17), 1, cv2.LINE_AA)
@@ -213,14 +182,11 @@ while cap.isOpened():
     cv2.imshow(window_name, im)
     if save_video and vw is not None:
         vw.write(im)
-    # Terminal logging
-    LOGGER.info(f"🟡 DETECTED {len(detections)} OBJECT(S): {' | '.join(detected_objects)}")
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord("q"):
         break
     elif key == ord("c"):
-        LOGGER.info("🟢 TRACKING RESET")
         selected_object_id = None
 
 cap.release()
